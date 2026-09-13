@@ -15,7 +15,7 @@ def save_checkpoint(path, model, optimizer, step, val_loss, config, train_loader
 
 
 def load_checkpoint(path, model, optimizer=None, device='cpu'):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt['model'])
     if optimizer is not None:
         optimizer.load_state_dict(ckpt['optimizer'])
