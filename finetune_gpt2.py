@@ -12,7 +12,7 @@ import json
 
 from model import GPT, GPTConfig
 from checkpoint import save_checkpoint, load_checkpoint
-from hellaswag import eval_hellaswag
+from finetuning.arc_ai import eval_arc_ai
 from finetuning.lora import inject_lora_layers, freeze_param_for_lora
 from finetuning.dataloader_ft import DataLoaderFT
 
@@ -45,7 +45,7 @@ val_block_sizes = [1024]
 
 assert all([((B*T_train) % block_size == 0) for block_size in val_block_sizes]), f'{val_block_sizes} are not compatible with train - batch_size {B} and seq length {T_train}' 
 
-eval_step = 10 # hellaswag evaluation every 250th step
+eval_step = 10 # ARC-Easy evaluation every 10th step
 sampling_step = 80 # sample from the model every 500th step
 
 log_dir = "log_ft"
@@ -157,6 +157,11 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model  # always contains the "raw" model - ddp unwrapped
 
+# get the baseline eval score on pretrained model
+accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
+if master_process:
+    print(f"ARC-Easy Eval accuracy before Fine Tuning - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
+
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -213,9 +218,12 @@ for step in range(max_steps):
             print(f"step: {step}, validation loss: {val_loss_accum:.4f}")
             print("\n")
 
-    # @TODO: run ARC-AI (easy) eval
+    # run ARC-AI (easy) eval
     if step % eval_step == 0:
         uncompiled_model.eval()
+        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
+        if master_process:
+            print(f"ARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
 
 
     # once in a while, generate from model - sampling
