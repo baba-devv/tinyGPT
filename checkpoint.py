@@ -1,5 +1,6 @@
 import torch
 
+# @TODO: this is not handling LoRA checkpointing for now
 def save_checkpoint(path, model, optimizer, step, val_loss, config, train_loader, **kwargs):
     checkpoint = {
         'model': model.state_dict(),  # uncompiled model
