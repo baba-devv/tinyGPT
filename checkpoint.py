@@ -14,7 +14,7 @@ def save_checkpoint(path, model, optimizer, step, val_loss, config, train_loader
     }   
     torch.save(checkpoint, path)
 
-
+# @TODO: this is not handling LoRA checkpointing for now
 def load_checkpoint(path, model, optimizer=None, device='cpu'):
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt['model'])

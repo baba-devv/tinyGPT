@@ -62,7 +62,7 @@ if checkpointing:
     os.makedirs(checkpoint_dir, exist_ok=True)
 
 
-resume_from = "model_19072.pt"
+resume_from = "base_model.pt"
 if resume_from and os.path.isdir(pretrain_log_dir):
     resume_from = os.path.join("checkpoint", resume_from)
     resume_from = os.path.join(pretrain_log_dir, resume_from) # point it to the correct file
@@ -342,6 +342,13 @@ for step in range(max_steps):
                 value['avg_accuracy'] = avg_accuracy
 
             f.write(json.dumps(value) + "\n")
+
+    # run ARC-AI (easy) eval
+    if step == max_steps-1:
+        uncompiled_model.eval()
+        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
+        if master_process:
+            print(f"Final ARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
 
 if ddp:
     destroy_process_group()
