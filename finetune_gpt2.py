@@ -213,16 +213,14 @@ for step in range(max_steps):
 
         val_loss_accum = val_loss_accum.item()
         if master_process:
-            print(f"\n")
-            print(f"step: {step}, validation loss: {val_loss_accum:.4f}")
-            print("\n")
+            print(f"\nstep: {step}, validation loss: {val_loss_accum:.4f}\n")
 
     # run ARC-AI (easy) eval
     if step % eval_step == 0:
         uncompiled_model.eval()
         accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=T_MAX)
         if master_process:
-            print(f"ARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
+            print(f"\nARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}\n")
 
 
     # once in a while, generate from model - sampling
