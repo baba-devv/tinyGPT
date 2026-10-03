@@ -14,7 +14,7 @@ from model import GPT, GPTConfig
 from checkpoint import save_checkpoint, load_checkpoint
 from finetuning.arc_ai import eval_arc_ai
 from finetuning.lora import inject_lora_layers, freeze_param_for_lora
-from finetuning.dataloader_ft import DataLoaderFT
+from finetuning.dataloader_ft import DataLoaderFT, T_MAX
 
 use_compile = True
 
@@ -22,9 +22,13 @@ use_compile = True
 rank = 8  # based on the paper for med size GPT
 alpha = 32 # based on the paper
 
-total_batch_size = 8192 # 2**13, ~8k, in number of tokens
-B = 4 # micro batch size
-block_size_train = T_train = 1024 # sequence length
+total_batch = 128 # number of sequences per optimizer step
+B = 32 # micro batch size, each row is exactly one sequence
+T_train = T_MAX # fixed padded sequence length, the T here is not part of any batch calculation
+
+num_train_questions = 2251 # ARC-Easy train split
+num_val_questions = 570 # ARC-Easy validation split
+num_epochs = 10
 
 vocab_size = 50304
 n_layer: int = 12 # number of layers
@@ -33,17 +37,13 @@ n_embd: int = 768  # embedding dimension
 
 max_lr = 5e-4
 min_lr = max_lr * 0.1 # go to 10% of the max_lr according to GPT-3
-warmup_steps = 5
-max_steps = 90
+warmup_steps = 6
+max_steps = num_epochs * num_train_questions // total_batch # one step consumes total_batch sequences
 
 learning_rate = 2e-4
 weight_decay = 0.1 # 10%
 
-val_step = 8 # validation loss every 100th step
-val_loss_steps = 3
-val_block_sizes = [1024]
-
-assert all([((B*T_train) % block_size == 0) for block_size in val_block_sizes]), f'{val_block_sizes} are not compatible with train - batch_size {B} and seq length {T_train}' 
+val_step = 10 # validation loss every 100th step
 
 eval_step = 10 # ARC-Easy evaluation every 10th step
 sampling_step = 80 # sample from the model every 500th step
@@ -110,12 +110,16 @@ else:
         device = "mps"
     print(f"Using device: {device}")
 
-assert total_batch_size % (B * T_train * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T_train * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T_train * ddp_world_size)
+assert total_batch % (B * ddp_world_size) == 0, "make sure total_batch is divisible by B * ddp_world_size"
+grad_accum_steps = total_batch // (B * ddp_world_size)
+
+# one pass over the validation split, every rank takes B questions per step
+val_loss_steps = num_val_questions // (B * ddp_world_size)
 
 if master_process:
-    print(f"total desired batch size: {total_batch_size}")
+    print(f"total desired batch: {total_batch}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print(f"=> max steps: {max_steps}, validation steps: {val_loss_steps}")
 
 # seeding
 torch.manual_seed(seed)
@@ -157,11 +161,6 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model  # always contains the "raw" model - ddp unwrapped
 
-# get the baseline eval score on pretrained model
-accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
-if master_process:
-    print(f"ARC-Easy Eval accuracy before Fine Tuning - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
-
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -177,8 +176,8 @@ def get_lr(it):
 
 # init data loader - DataLoaderFT masks the question tokens out of the targets with -1,
 # so the fine-tune is only scored on producing the answer. data_root defaults to finetuning/ai2_arc
-train_loader = DataLoaderFT(B=B, T=T_train, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderFT(B=B, T=T_train, process_rank=ddp_rank, num_processes=ddp_world_size, split="validation") # T has to be None for val, in case it is passed
+train_loader = DataLoaderFT(B=B, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderFT(B=B, process_rank=ddp_rank, num_processes=ddp_world_size, split="validation")
 
 
 # ---------------------------------------------------------------------------------------
@@ -193,7 +192,7 @@ for step in range(max_steps):
     # eval step, once in a while calculate the validation loss
     if step % val_step == 0:
         raw_model.eval()
-        val_loader.reset(split="validation")
+        val_loader.reset()
 
         with torch.no_grad():
             val_loss_accum = 0.0
@@ -221,7 +220,7 @@ for step in range(max_steps):
     # run ARC-AI (easy) eval
     if step % eval_step == 0:
         uncompiled_model.eval()
-        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
+        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=T_MAX)
         if master_process:
             print(f"ARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
 
@@ -313,10 +312,10 @@ for step in range(max_steps):
     t1 = time.time()
     dt = t1-t0  # time difference in seconds
 
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_processed = B * T_train * grad_accum_steps * ddp_world_size # includes the padding tokens
     tokens_per_sec = tokens_processed / dt
 
-    mfu = raw_model.estimate_mfu(B * grad_accum_steps, train_loader.T, dt)
+    mfu = raw_model.estimate_mfu(B * grad_accum_steps, T_train, dt)
 
     if master_process:
         loss = loss_accum.item()
@@ -346,7 +345,7 @@ for step in range(max_steps):
     # run ARC-AI (easy) eval
     if step == max_steps-1:
         uncompiled_model.eval()
-        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
+        accuracy, avg_accuracy = eval_arc_ai(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=T_MAX)
         if master_process:
             print(f"Final ARC-Easy Eval accuracy - {accuracy*100:.2f}, avg accuracy - {avg_accuracy*100:.2f}")
 
