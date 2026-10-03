@@ -8,6 +8,18 @@ dependencies = [
     "datasets>=5.0.1",
     "matplotlib>=3.11.1",
     "tiktoken>=0.13.0",
-    "torch>=2.13.0",
+    "torch>=2.11.0", # 2.11 is the newest build on the cu128 index (see below)
     "transformers>=5.15.0",
 ]
+
+# Linux (the cloud GPU box) gets torch built for CUDA 12.8, matching its 570-series driver -
+# the default PyPI wheel targets CUDA 13, which needs driver >= 580. macOS keeps the PyPI wheel.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true # only torch is pulled from here, everything else stays on PyPI
