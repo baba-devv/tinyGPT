@@ -128,7 +128,7 @@ The eval scores every option of a question by its loss as a continuation of the 
 
 Validation loss flattens between steps 50 and 70 and rises after that while the train loss keeps falling, so the model starts overfitting after about 4 epochs. The checkpoint is taken from that flat region. This is a single run.
 
-<!-- TODO: link to the LoRA checkpoint -->
+Weights: [FT checkpoint](https://huggingface.co/baba-dev/tinygpt-lora/blob/main/model_00050.pt)
 
 #### Run
 
