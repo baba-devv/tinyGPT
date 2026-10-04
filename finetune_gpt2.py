@@ -176,7 +176,7 @@ def get_lr(it):
 
 # init data loader - DataLoaderFT masks the question tokens out of the targets with -1,
 # so the fine-tune is only scored on producing the answer. data_root defaults to finetuning/ai2_arc
-train_loader = DataLoaderFT(B=B, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+train_loader = DataLoaderFT(B=B, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", shuffle=True, seed=seed)
 val_loader = DataLoaderFT(B=B, process_rank=ddp_rank, num_processes=ddp_world_size, split="validation")
 
 
@@ -195,7 +195,8 @@ for step in range(max_steps):
         val_loader.reset()
 
         with torch.no_grad():
-            val_loss_accum = 0.0
+            val_loss_sum = torch.zeros((), device=device)
+            val_tokens = torch.zeros((), device=device)
 
             for _ in range(val_loss_steps):
                 # check the loss on validation set
@@ -203,15 +204,18 @@ for step in range(max_steps):
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
                     # forward pass  # calculate logits and loss
-                    logits, loss = uncompiled_model(x, y) 
-                
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
+                    logits, loss = uncompiled_model(x, y)
+
+                # loss is the mean over this batch's answer tokens, mean * count gives back their summed loss
+                n = (y != -1).sum()
+                val_loss_sum += loss.detach() * n
+                val_tokens += n
 
         if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_tokens, op=dist.ReduceOp.SUM)
 
-        val_loss_accum = val_loss_accum.item()
+        val_loss_accum = (val_loss_sum / val_tokens).item() # mean over every answer token of the pass
         if master_process:
             print(f"\nstep: {step}, validation loss: {val_loss_accum:.4f}\n")
 
@@ -273,9 +277,16 @@ for step in range(max_steps):
     # zero the gradients to avoid accumulation
     optimizer.zero_grad()
 
+    # fetch the whole accumulation window up front and count its answer tokens (over all ranks), so every
+    # answer token gets the same weight - averaging per micro-batch means would over-weight the tokens of
+    # micro-batches that happen to hold fewer answer tokens
+    batches = [train_loader.next_batch() for _ in range(grad_accum_steps)]
+    n_tokens = torch.tensor(sum(int((y != -1).sum()) for _, y in batches), device=device)
+    if ddp:
+        dist.all_reduce(n_tokens, op=dist.ReduceOp.SUM)
+
     loss_accum = 0.0
-    for mini_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
+    for mini_step, (x, y) in enumerate(batches):
         x, y = x.to(device), y.to(device)
 
         if ddp:
@@ -285,15 +296,20 @@ for step in range(max_steps):
         with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
             # forward pass  # calculate logits and loss
             logits, loss = model(x, y)
-        loss = loss / grad_accum_steps  # this is to cater for the mean reduction matching had the Batch dim was equal to desired Batch dim
-        
+        # loss is the mean over this micro-batch's answer tokens: mean * count / n_tokens turns it into
+        # this micro-batch's share of the mean over every answer token in the step
+        loss = loss * (y != -1).sum() / n_tokens
+
         loss_accum += loss.detach()
+
+        if ddp:
+            loss = loss * ddp_world_size # DDP averages the grads over ranks, undo it - n_tokens already spans all ranks
 
         # backward pass == calculate grads
         loss.backward()
 
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM) # each rank holds its share of the global mean, sum them
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration

@@ -117,11 +117,16 @@ class DataLoaderFT:
     never attends to another one. The targets of every non-answer position are set to -1 so
     model.forward's cross_entropy(ignore_index=-1) skips them."""
 
-    def __init__(self, B, process_rank, num_processes, split, data_root=DATA_CACHE_DIR):
+    def __init__(self, B, process_rank, num_processes, split, data_root=DATA_CACHE_DIR, shuffle=False, seed=42):
         self.B = B
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'train', 'validation'}, "split should be either train or validation"
+        # shuffle the row order of every shard each epoch, so the model doesn't see the same batch
+        # sequence every epoch, and the rows dropped at the end of an epoch differ each time
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
 
         # get the shard filenames
         shards = [s for s in os.listdir(data_root) if f"_{split}_" in s]
@@ -133,7 +138,7 @@ class DataLoaderFT:
 
         # state, init at shard zero
         self.current_shard = 0
-        self.tokens, self.loss_mask = load_tokens(shards[self.current_shard])
+        self.load_shard()
 
         # ARC is tiny, so check that a single shard holds at least one batch across all processes
         needed = B * num_processes
@@ -143,9 +148,19 @@ class DataLoaderFT:
         )
         self.current_position = self.B * self.process_rank # positions are in rows (sequences) now
 
-    def reset(self):
-        self.current_shard = 0
+    def load_shard(self):
         self.tokens, self.loss_mask = load_tokens(self.shards[self.current_shard])
+        if self.shuffle:
+            # seeded by (epoch, shard) and NOT by rank: every rank must hold the same permutation,
+            # so that their strided slices of it stay disjoint
+            g = torch.Generator().manual_seed(self.seed + self.epoch * len(self.shards) + self.current_shard)
+            perm = torch.randperm(len(self.tokens), generator=g)
+            self.tokens, self.loss_mask = self.tokens[perm], self.loss_mask[perm]
+
+    def reset(self):
+        self.epoch = 0
+        self.current_shard = 0
+        self.load_shard()
         self.current_position = self.B * self.process_rank
 
     def next_batch(self, B=None):
@@ -162,11 +177,15 @@ class DataLoaderFT:
 
         # advance the position in the rows
         self.current_position += B * self.num_processes
-        # if this rank's next batch would be out of bounds, reset - each rank decides for itself
-        if self.current_position + B > len(self.tokens):
+        # move to the next shard when the next step doesn't fit for ALL ranks. Checked on the step's start
+        # (same on every rank) rather than this rank's own slice, so all ranks switch shard - and permutation - together
+        step_start = self.current_position - B * self.process_rank
+        if step_start + B * self.num_processes > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens, self.loss_mask = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * self.process_rank  # 1 epoch completed (almost)
+            if self.current_shard == 0:
+                self.epoch += 1 # wrapped past the last shard, the next pass gets a fresh shuffle
+            self.load_shard()
+            self.current_position = B * self.process_rank
 
         return x, y
 
