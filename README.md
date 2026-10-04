@@ -91,9 +91,65 @@ The gap also widens over training, as the model becomes more dependent on positi
 
 This is the documented behaviour that we've tried to *reproduce* and it's the practical reason long-context models can't simply be run past their training window.
 
+## SFT (LoRA)
+
+Supervised fine-tuning of the pre-trained tinyGPT checkpoint with LoRA. The LoRA layer, the injection and the freezing are written from scratch in `finetuning/lora.py` - no PEFT library involved.
+
+- The base weights stay frozen, only the low-rank `A` and `B` matrices are trained.
+- tinyGPT uses a fused `c_attn` (q, k and v in one matrix), so the layer keeps a separate rank-`r` adapter for each of q, k and v and writes them back into the fused output. This is the same math as LoRA on three separate projections, and `model.py` stays untouched.
+- `B` starts at zero and `A` is Kaiming-uniform, so at step 0 the model is exactly the pre-trained one. The update is scaled by `alpha / r`.
+- The layers are injected from outside the model by layer name, rank and alpha are plain settings, and `merge()` / `unmerge()` fold the update into the base weights for inference.
+
+#### Setup
+
+| | |
+|---|---|
+| task | ARC-Easy (grade-school science, multiple choice) |
+| train data | ARC-Easy train split, 2,251 questions |
+| rank / alpha | 8 / 32 |
+| trainable params | 442,368 (0.36% of 123.69M) |
+| batch | 128 sequences per step |
+| lr | 5e-4 peak, 6 warmup steps, cosine decay |
+| weight decay | 0.1 |
+| checkpoint | step 50 (~2.8 epochs) |
+
+Every training row is one question with its correct answer: `<|endoftext|>` + question + `" "` + answer, with no prompt template. The loss is only paid on the answer tokens.
+
+The eval scores every option of a question by its loss as a continuation of the question and picks the lowest. "raw" compares the summed loss of the options, "per-token" compares the mean loss per token. Numbers are on the ARC-Easy test split (2,376 questions), and the pre-trained model is evaluated in the same format with no examples.
+
+
+#### Results
+| | ARC-Easy (raw) | ARC-Easy (per-token) |
+|---|---|---|
+| tinygpt 124M + RoPE (pre-trained) | 52.69 | 47.01 |
+| **tinygpt 124M + RoPE + LoRA** | **58.08** | **56.78** |
+
+![SFT Loss/Eval Curve](log_ft/loss.png)
+
+Validation loss flattens between steps 50 and 70 and rises after that while the train loss keeps falling, so the model starts overfitting after about 4 epochs. The checkpoint is taken from that flat region. This is a single run.
+
+<!-- TODO: link to the LoRA checkpoint -->
+
+#### Run
+
+```bash
+uv run python finetuning/dataloader_ft.py # loads + tokenize ARC-Easy
+uv run python finetune_gpt2.py # expects the pre-trained checkpoint at log/checkpoint/base_model.pt
+```
+
+On ddp:
+```bash
+uv run torchrun --standalone --nproc_per_node=1 finetune_gpt2.py
+```
+
+## PEFT (Qwen3-4B)
+
+The same fine-tuning is also done the industry-standard way: `Qwen/Qwen3-4B-Base` fine-tuned with LoRA on ARC-Challenge using Hugging Face `transformers` + `peft`. The training loop has the same shape as `finetune_gpt2.py`, only the model, the LoRA injection and the adapter saving come from the libraries instead of `finetuning/lora.py`.
+
+The code and the run instructions are in [`peft/`](peft/README.md).
+
 ## ToDos
-- Some kind of SFT (Supervised Fine Tuning) - at this level we can do FFT but will start with LoRA.
-- Adding other evals - perplexity, etc.
+- Adding other evals - perplexity, etc. (ARC AI already added)
 - Experimenting with better inits
 - KV Caching
 - Batched inference and throughput measurement.
@@ -107,3 +163,4 @@ This is the documented behaviour that we've tried to *reproduce* and it's the pr
 - Su et al., *RoFormer: Enhanced Transformer with Rotary Position Embedding*
 - Dao et al., *FlashAttention*
 - Zellers et al., *HellaSwag: Can a Machine Really Finish Your Sentence?*
+- Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models*

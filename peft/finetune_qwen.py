@@ -40,7 +40,7 @@ gradient_checkpointing = True  # @TODO: What does this do ?
 # same batching as finetune_gpt2.py: each row is one question+answer padded to T_MAX, so the
 # batch size is counted in sequences
 total_batch_size = 128 # sequences per optimizer step
-B = 8 # micro batch size - lower than tinyGPT's 32 because the fp32 logits are B x T_MAX x 151936 here
+B = 64 # micro batch size - lower than tinyGPT's 32 because the fp32 logits are B x T_MAX x 151936 here
 num_epochs = 10 # max_steps is derived from the train split size once the loader is up
 
 max_lr = 2e-4 # the usual LoRA lr, ~10x what full fine-tuning would use
@@ -60,7 +60,7 @@ os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "log.json")
 
 checkpointing = True
-checkpoint_step = 100
+checkpoint_step = 10
 checkpoint_dir = os.path.join(log_dir, "checkpoint")
 os.makedirs(checkpoint_dir, exist_ok=True)
 save_merged = False # also write a merged full model (~8GB) at the end, in addition to the adapter (~tens of MB)
